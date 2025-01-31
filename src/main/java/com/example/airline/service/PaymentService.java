@@ -7,31 +7,28 @@ import com.example.airline.exception.InvalidPaymentStateException;
 import com.example.airline.exception.RefundFailedException;
 import com.example.airline.exception.ResourceNotFoundException;
 import com.example.airline.repository.PaymentRepository;
-import com.example.airline.repository.WalletRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import java.math.BigDecimal;
 
 @Service
 public class PaymentService {
 
     private final PaymentRepository paymentRepository;
-    private final WalletRepository walletRepository;
-    // PaymentService.java (continued)
+    private final WalletService walletService;
+
     public PaymentService(
             PaymentRepository paymentRepository,
-            WalletRepository walletRepository
+            WalletService walletService
     ) {
         this.paymentRepository = paymentRepository;
-        this.walletRepository = walletRepository;
+        this.walletService = walletService;
     }
 
     @Transactional
     public Payment processPayment(Long bookingId, Long userId, Double amount) {
-        Wallet wallet = walletRepository.findByUserId(userId)
-                .orElseThrow(() -> new ResourceNotFoundException("Wallet not found"));
-
-        if (wallet.getBalance().compareTo(amount) < 0) {
+        // First check if user has sufficient balance
+        Wallet wallet = walletService.getWallet(userId);
+        if (wallet.getBalance() < amount) {
             throw new InsufficientBalanceException("Insufficient balance in wallet");
         }
 
@@ -43,10 +40,9 @@ public class PaymentService {
         payment.setStatus(Payment.PaymentStatus.PENDING);
 
         try {
-            // Deduct from wallet
-            wallet.setBalance(wallet.getBalance()-(amount));
-            walletRepository.save(wallet);
-
+            // Deduct from wallet and create DEBIT transaction
+            walletService.deductMoney(userId, amount, "Payment for booking " + bookingId);
+            
             // Update payment status
             payment.setStatus(Payment.PaymentStatus.SUCCESS);
         } catch (Exception e) {
@@ -58,32 +54,7 @@ public class PaymentService {
     }
 
     @Transactional
-    public Payment refundPayment(Long paymentId) {
-        Payment payment = paymentRepository.findById(paymentId)
-                .orElseThrow(() -> new ResourceNotFoundException("Payment not found"));
-
-        if (payment.getStatus() != Payment.PaymentStatus.SUCCESS) {
-            throw new RuntimeException("Cannot refund non-successful payment");
-        }
-
-        Wallet wallet = walletRepository.findByUserId(payment.getUserId())
-                .orElseThrow(() -> new ResourceNotFoundException("Wallet not found"));
-
-        // Add amount back to wallet
-        wallet.setBalance(wallet.getBalance()+(payment.getAmount()));
-        walletRepository.save(wallet);
-
-        // Update payment status
-        payment.setStatus(Payment.PaymentStatus.REFUNDED);
-        return paymentRepository.save(payment);
-    }
-    public Payment findPaymentByBookingId(Long bookingId) {
-        return paymentRepository.findByBookingIdAndStatus(bookingId, Payment.PaymentStatus.SUCCESS)
-                .orElse(null);
-    }
-
-    @Transactional
-    public Payment processRefund(Long paymentId, Double refundAmount) {
+    public Payment refundPayment(Long paymentId, Double refundAmount) {
         Payment payment = paymentRepository.findById(paymentId)
                 .orElseThrow(() -> new ResourceNotFoundException("Payment not found"));
 
@@ -91,32 +62,20 @@ public class PaymentService {
             throw new InvalidPaymentStateException("Cannot refund payment in current state: " + payment.getStatus());
         }
 
-        Payment refund = new Payment();
-        refund.setBookingId(payment.getBookingId());
-        refund.setUserId(payment.getUserId());
-        refund.setAmount(-refundAmount);  // Negative amount for refund
-        refund.setMode(Payment.PaymentMode.WALLET);
-        refund.setStatus(Payment.PaymentStatus.PENDING);
-
         try {
-            // Add amount back to wallet
-            Wallet wallet = walletRepository.findByUserId(payment.getUserId())
-                    .orElseThrow(() -> new ResourceNotFoundException("Wallet not found"));
-
-            wallet.setBalance(wallet.getBalance() + refundAmount);
-            walletRepository.save(wallet);
-
-            // Update refund status
-            refund.setStatus(Payment.PaymentStatus.SUCCESS);
-            refund = paymentRepository.save(refund);
-
-            // Update original payment status
+            // Add refund amount to wallet and create CREDIT transaction
+            walletService.addMoney(payment.getUserId(), refundAmount, "Refund for booking " + payment.getBookingId());
+            
+            // Update payment status
             payment.setStatus(Payment.PaymentStatus.REFUNDED);
-            paymentRepository.save(payment);
-
-            return refund;
+            return paymentRepository.save(payment);
         } catch (Exception e) {
             throw new RefundFailedException("Failed to process refund: " + e.getMessage());
         }
+    }
+
+    public Payment findPaymentByBookingId(Long bookingId) {
+        return paymentRepository.findByBookingIdAndStatus(bookingId, Payment.PaymentStatus.SUCCESS)
+                .orElse(null);
     }
 }

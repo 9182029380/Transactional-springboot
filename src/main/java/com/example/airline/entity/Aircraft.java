@@ -1,10 +1,10 @@
 package com.example.airline.entity;
 
 import jakarta.persistence.*;
-import lombok.Data;
+
 
 @Entity
-//@Data
+
 @Table(name = "aircrafts")
 public class Aircraft {
     @Id

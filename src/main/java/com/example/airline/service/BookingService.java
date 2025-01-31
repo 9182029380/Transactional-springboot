@@ -6,7 +6,6 @@ import com.example.airline.exception.*;
 import com.example.airline.repository.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.LocalDateTime;
 
@@ -41,12 +40,7 @@ public class BookingService {
             throw new ResourceNotFoundException("Not enough seats available");
         }
 
-        // Calculate total amount
-//        Double totalAmount = flight.getBasePrice()
-//                .multiply(new BigDecimal((request.getNumberOfSeats()));
-
-        Double totalAmount = flight.getBasePrice() * Double.valueOf(request.getNumberOfSeats());
-
+        Double totalAmount = flight.getBasePrice() * request.getNumberOfSeats();
 
         // Create booking
         Booking booking = new Booking();
@@ -76,32 +70,20 @@ public class BookingService {
                 booking = bookingRepository.save(booking);
             } else {
                 booking.setStatus(Booking.BookingStatus.FAILED);
-                booking = bookingRepository.save(booking);
-                throw new RuntimeException("Payment failed");
+                bookingRepository.save(booking);
+                throw new PaymentFailedException("Payment failed for booking");
             }
-        } catch (Exception e) {
+        } catch (PaymentFailedException e) {
             booking.setStatus(Booking.BookingStatus.FAILED);
             bookingRepository.save(booking);
             throw e;
+        } catch (Exception e) {
+            booking.setStatus(Booking.BookingStatus.FAILED);
+            bookingRepository.save(booking);
+            throw new PaymentFailedException("Payment failed for booking", e);
         }
 
         return booking;
-    }
-    private Double calculateRefundAmount(Booking booking, LocalDateTime departureTime) {
-        LocalDateTime now = LocalDateTime.now();
-        Duration timeUntilDeparture = Duration.between(now, departureTime);
-
-        // Refund policy based on time until departure
-        if (timeUntilDeparture.toDays() > 7) {
-            // Full refund if cancelled more than 7 days before
-            return booking.getTotalAmount();
-        } else if (timeUntilDeparture.toDays() > 3) {
-            // 75% refund if cancelled 3-7 days before
-            return booking.getTotalAmount() * 0.75;
-        } else {
-            // 50% refund if cancelled 1-3 days before
-            return booking.getTotalAmount() * 0.50;
-        }
     }
 
     @Transactional
@@ -114,27 +96,33 @@ public class BookingService {
         }
 
         Flight flight = flightService.getFlight(booking.getFlightId());
-       validateCancellationDeadline(flight.getDepartureTime());
+        validateCancellationDeadline(flight.getDepartureTime());
+        Double refundAmount = calculateRefundAmount(booking, flight.getDepartureTime());
 
         try {
-            // Update flight seats using the new method
-            flightService.updateFlightSeats(flight.getId(), booking.getNumberOfSeats());
-
-            // Process refund
-            Payment payment = paymentService.findPaymentByBookingId(booking.getId());
-            if (payment != null && payment.getStatus() == Payment.PaymentStatus.SUCCESS) {
-                Double refundAmount = calculateRefundAmount(booking, flight.getDepartureTime());
-                paymentService.processRefund(payment.getId(), refundAmount);
+            // Process refund if applicable
+            if (refundAmount > 0) {
+                Payment payment = paymentService.findPaymentByBookingId(booking.getId());
+                if (payment != null && payment.getStatus() == Payment.PaymentStatus.SUCCESS) {
+                    paymentService.refundPayment(payment.getId(), refundAmount);
+                }
             }
+
+            // Update flight seats
+            flight.setAvailableSeats(flight.getAvailableSeats() + booking.getNumberOfSeats());
+            flightService.updateFlightStatus(flight.getId(), flight.getStatus());
 
             // Update booking status
             booking.setStatus(Booking.BookingStatus.CANCELLED);
             return bookingRepository.save(booking);
 
+        } catch (PaymentFailedException e) {
+            throw e;
         } catch (Exception e) {
             throw new BookingCancellationException("Failed to cancel booking: " + e.getMessage());
         }
     }
+
     private void validateCancellationDeadline(LocalDateTime departureTime) {
         LocalDateTime now = LocalDateTime.now();
 
@@ -143,31 +131,32 @@ public class BookingService {
             throw new InvalidBookingStateException("Cannot cancel booking after flight departure time");
         }
 
-//        // Calculate time until departure
-//        Duration timeUntilDeparture = Duration.between(now, departureTime);
-//
-//        // Minimum cancellation period - 24 hours before departure
-//        if (timeUntilDeparture.toHours() < 1) {
-//            throw new InvalidBookingStateException(
-//                    "Bookings must be cancelled at least 24 hours before departure"
-//            );
-//        }
-//
-//        // Additional validation tiers matching refund policy
-//        long daysUntilDeparture = timeUntilDeparture.toDays();
-//
-//        if (daysUntilDeparture <= 0) {
-//            throw new InvalidBookingStateException(
-//                    "Same day cancellations are not allowed"
-//            );
-//        } else if (daysUntilDeparture <= 3) {
-//            // Log warning about 50% refund tier
-//            // You might want to add a logging framework if not already present
-//            System.out.println("Warning: Booking cancelled within 1-3 days of departure - 50% refund applies");
-//        } else if (daysUntilDeparture <= 7) {
-//            // Log warning about 75% refund tier
-//            System.out.println("Warning: Booking cancelled within 3-7 days of departure - 75% refund applies");
-//        }
-//        // No additional validation needed for > 7 days as it's eligible for full refund
+        // Calculate time until departure
+        Duration timeUntilDeparture = Duration.between(now, departureTime);
+        long daysUntilDeparture = timeUntilDeparture.toDays();
+
+        if (daysUntilDeparture <= 0) {
+            throw new InvalidBookingStateException("Same day cancellations are not allowed");
+        }
+    }
+
+    private Double calculateRefundAmount(Booking booking, LocalDateTime departureTime) {
+        LocalDateTime now = LocalDateTime.now();
+        Duration timeUntilDeparture = Duration.between(now, departureTime);
+
+        // Refund policy based on time until departure
+        if (timeUntilDeparture.toDays() > 7) {
+            // Full refund if cancelled more than 7 days before
+            return booking.getTotalAmount();
+        } else if (timeUntilDeparture.toDays() > 3) {
+            // 75% refund if cancelled 3-7 days before
+            return booking.getTotalAmount() * 0.75;
+        } else if (timeUntilDeparture.toDays() > 1) {
+            // 50% refund if cancelled 1-3 days before
+            return booking.getTotalAmount() * 0.50;
+        } else {
+            // No refund if cancelled less than 24 hours before
+            return 0.0;
+        }
     }
 }
